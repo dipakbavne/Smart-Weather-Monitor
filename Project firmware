@@ -1,1 +1,346 @@
-
+#include <WiFi.h>   
+#include <ThingSpeak.h>   
+#include <Wire.h>   
+#include <LiquidCrystal_I2C.h>   
+#include <Adafruit_BMP085.h>   
+#include <DHT.h>   
+#include <HardwareSerial.h>   
+#include <DFRobotDFPlayerMini.h>   
+   
+// ==========================   
+// WIFI + THINGSPEAK   
+// ==========================   
+char ssid[] = "ESP32";   
+char pass[] = "12345678";   
+   
+unsigned long channelID = 3402842#;   
+const char *writeAPIKey = "JHI5M890PW1L5LO9";   
+   
+WiFiClient client;   
+   
+// ==========================   
+// PINS   
+// ==========================   
+#define DHTPIN 4   
+#define DHTTYPE DHT11   
+   
+#define RAIN_PIN 27   
+#define RAIN_LED 15   
+#define STATUS_LED 13   
+   
+#define DF_RX 16   
+#define DF_TX 17   
+   
+// ==========================   
+// OBJECTS   
+// ==========================   
+DHT dht(DHTPIN, DHTTYPE);   
+Adafruit_BMP085 bmp;   
+   
+LiquidCrystal_I2C lcd27(0x27, 16, 2);   
+LiquidCrystal_I2C lcd3F(0x3F, 16, 2);   
+LiquidCrystal_I2C *lcd;   
+   
+HardwareSerial mySerial(2);   
+DFRobotDFPlayerMini dfplayer;   
+   
+// ==========================   
+// TIMERS   
+// ==========================   
+unsigned long tSerial = 0;   
+unsigned long tLCD = 0;   
+unsigned long tCloud = 0;   
+unsigned long tAlert = 0;   
+   
+// ==========================   
+// STATES   
+// ==========================   
+int lcdPage = 0;   
+bool dfOK = false;   
+bool lcdOK = false;   
+bool bmpOK = false;   
+   
+String lastRain = "";   
+bool tempFlag = false;   
+bool humidityFlag = false;   
+bool eventActive = false;   
+   
+float lastTemp = 0;   
+float lastHum = 0;   
+   
+// ==========================   
+// LCD ADDRESS DETECTION   
+// ==========================   
+bool checkI2C(byte address) {   
+  Wire.beginTransmission(address);   
+  return (Wire.endTransmission() == 0);   
+}   
+   
+// ==========================   
+// VOICE FUNCTION   
+// ==========================   
+void playVoiceTwice(int track) {   
+  dfplayer.play(track);   
+  delay(4000);   
+  dfplayer.play(track);   
+}   
+   
+// ==========================   
+// SETUP   
+// ==========================   
+void setup() {   
+   
+  Serial.begin(115200);   
+   
+  pinMode(RAIN_PIN, INPUT);   
+  pinMode(RAIN_LED, OUTPUT);   
+  pinMode(STATUS_LED, OUTPUT);   
+   
+  digitalWrite(STATUS_LED, HIGH);   
+   
+  dht.begin();   
+  Wire.begin(21, 22);   
+   
+  // BMP085   
+  bmpOK = bmp.begin();   
+   
+  // ==========================   
+  // LCD ADDRESS DETECTION   
+  // ==========================   
+  if (checkI2C(0x27)) {   
+    lcd = &lcd27;   
+    lcdOK = true;   
+  }   
+  else if (checkI2C(0x3F)) {   
+    lcd = &lcd3F;   
+    lcdOK = true;   
+  }   
+   
+  // LCD START   
+  if (lcdOK) {   
+    lcd->init();   
+    lcd->backlight();   
+    lcd->setCursor(0,0);   
+    lcd->print("Smart Weather");   
+    lcd->setCursor(0,1);   
+    lcd->print("Monitor");   
+    delay(1500);   
+  }   
+   
+  // DFPLAYER   
+  mySerial.begin(9600, SERIAL_8N1, DF_RX, DF_TX);   
+   
+  if (dfplayer.begin(mySerial)) {   
+    dfOK = true;   
+    dfplayer.volume(28);   
+   
+    // SYSTEM STATUS - STARTUP FILE   
+    dfplayer.play(1);   
+    delay(4000);   // startup safe delay   
+  }   
+   
+  // INITIAL RAIN STATE   
+  lastRain = (digitalRead(RAIN_PIN) == LOW) ? "RAIN" : "DRY";   
+   
+  // WIFI   
+  WiFi.begin(ssid, pass);   
+   
+  while (WiFi.status() != WL_CONNECTED) {   
+    delay(500);   
+    Serial.print(".");   
+  }   
+   
+  ThingSpeak.begin(client);   
+   
+  Serial.println("\nSYSTEM READY");   
+   
+  if (lcdOK) {   
+    Serial.println("LCD  : OK");   
+  }   
+  else {   
+    Serial.println("LCD  : NOT FOUND");   
+  }   
+   
+  Serial.print("BMP  : ");   
+  Serial.println(bmpOK ? "OK" : "FAIL");   
+}   
+   
+// ==========================   
+// LOOP   
+// ==========================   
+void loop() {   
+   
+  if (WiFi.status() != WL_CONNECTED) {   
+    WiFi.begin(ssid, pass);   
+  }   
+   
+  // ==========================   
+  // SENSOR READ   
+  // ==========================   
+  float temp = dht.readTemperature();   
+  float hum  = dht.readHumidity();   
+   
+  float pres = 0;   
+   
+  if (bmpOK) {   
+    pres = bmp.readPressure() / 100.0;   
+  }   
+   
+  int rain = digitalRead(RAIN_PIN);   
+   
+  // Keep previous valid DHT value if reading fails   
+  if (!isnan(temp)) {   
+    lastTemp = temp;   
+  }   
+   
+  if (!isnan(hum)) {   
+    lastHum = hum;   
+  }   
+   
+  temp = lastTemp;   
+  hum = lastHum;   
+   
+  String rainState = (rain == LOW) ? "RAIN" : "DRY";   
+   
+  digitalWrite(RAIN_LED, (rain == LOW));   
+   
+  // ==========================   
+  // SERIAL   
+  // ==========================   
+  if (millis() - tSerial >= 5000) {   
+    tSerial = millis();   
+   
+    Serial.println("\n====================");   
+    Serial.println("SMART WEATHER SYSTEM");   
+   
+    Serial.print("Temp : "); Serial.print(temp); Serial.println(" C");   
+    Serial.print("Hum  : "); Serial.print(hum); Serial.println(" %");   
+    Serial.print("Press: "); Serial.print(pres); Serial.println(" hPa");   
+    Serial.print("Rain : "); Serial.println(rainState);   
+   
+    Serial.print("WiFi : ");   
+    Serial.println(WiFi.status() == WL_CONNECTED ? "OK" : "FAIL");   
+   
+    Serial.print("DF   : ");   
+    Serial.println(dfOK ? "OK" : "FAIL");   
+   
+    Serial.print("LCD  : ");   
+    Serial.println(lcdOK ? "OK" : "FAIL");   
+   
+    Serial.println("====================");   
+  }   
+   
+  // ==========================   
+  // LCD ROTATION   
+  // ==========================   
+  if (lcdOK && millis() - tLCD >= 2000) {   
+    tLCD = millis();   
+   
+    lcd->clear();   
+   
+    if (lcdPage == 0) {   
+      lcd->setCursor(0,0);   
+      lcd->print("Smart Weather");   
+      lcd->setCursor(0,1);   
+      lcd->print("Monitor");   
+    }   
+   
+    else if (lcdPage == 1) {   
+      lcd->setCursor(0,0);   
+      lcd->print("Temp: ");   
+      lcd->print(temp);   
+      lcd->print(" C");   
+   
+      lcd->setCursor(0,1);   
+      lcd->print("Hum : ");   
+      lcd->print(hum);   
+      lcd->print(" %");   
+    }   
+   
+    else if (lcdPage == 2) {   
+      lcd->setCursor(0,0);   
+      lcd->print("Press: ");   
+      lcd->print(pres);   
+      lcd->print(" hPa");   
+   
+      lcd->setCursor(0,1);   
+      lcd->print("Rain: ");   
+      lcd->print(rainState);   
+    }   
+   
+    else {   
+      lcd->setCursor(0,0);   
+      lcd->print("WiFi : ");   
+      lcd->print(WiFi.status()==WL_CONNECTED?"OK":"NO");   
+   
+      lcd->setCursor(0,1);   
+      lcd->print("DF Mini: ");   
+      lcd->print(dfOK?"OK":"NO");   
+    }   
+   
+    lcdPage = (lcdPage + 1) % 4;   
+  }   
+   
+  // ==========================   
+  // DFPLAYER LOGIC (FINAL FIX)   
+  // ==========================   
+  if (dfOK) {   
+   
+    eventActive = false;   
+   
+    // RAIN EVENT   
+    if (rainState != lastRain) {   
+   
+      eventActive = true;   
+   
+      if (rain == LOW) playVoiceTwice(2);   
+      else playVoiceTwice(3);   
+   
+      lastRain = rainState;   
+    }   
+   
+    // TEMP EVENT   
+    if (temp >= 40 && !tempFlag) {   
+      eventActive = true;   
+      playVoiceTwice(4);   
+      tempFlag = true;   
+    }   
+   
+    if (temp < 40) tempFlag = false;   
+   
+    // HUMIDITY EVENT   
+    if (hum > 80 && !humidityFlag) {   
+      eventActive = true;   
+      playVoiceTwice(5);   
+      humidityFlag = true;   
+    }   
+   
+    if (hum <= 80) {   
+      humidityFlag = false;   
+    }   
+   
+    // NORMAL WEATHER (ONLY IF NO EVENT)   
+    if (!eventActive && millis() - tAlert >= 10000) {   
+   
+      tAlert = millis();   
+   
+      dfplayer.play(7);   // Weather Conditions are Normal   
+    }   
+  }   
+   
+  // ==========================   
+  // THINGSPEAK   
+  // ==========================   
+  if (millis() - tCloud >= 15000) {   
+    tCloud = millis();   
+   
+    ThingSpeak.setField(1, temp);   
+    ThingSpeak.setField(2, hum);   
+    ThingSpeak.setField(3, pres);   
+    ThingSpeak.setField(4, rain == LOW ? 1 : 0);   
+   
+    int res = ThingSpeak.writeFields(channelID, writeAPIKey);   
+   
+    Serial.println(res == 200 ? "Cloud Update OK" : "Cloud Error");   
+  }   
+}
